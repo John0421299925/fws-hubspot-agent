@@ -1,0 +1,359 @@
+"""
+FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
+
+Everything Agent 2 needs is in this one file, deliberately, so it's easy
+to copy-paste into a single GitHub file rather than managing many small
+files and folders. This is the file Vercel runs.
+"""
+import os
+import time
+import logging
+import sys
+
+import requests
+from flask import Flask, request, jsonify
+import anthropic
+
+# ================================================================
+# CONFIG — real known values as defaults; secrets from env vars
+# ================================================================
+HUBSPOT_API_KEY = os.getenv("HUBSPOT_API_KEY")
+HUBSPOT_API_BASE = "https://api.hubapi.com"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+HUDOC_EMAIL = os.getenv("HUDOC_EMAIL", "futurewastesolutions.7b4e@app.hubdoc.com")
+JAMES_EMAIL = os.getenv("JAMES_EMAIL", "james@futurewaste.com.au")
+CHRISTINE_EMAIL = os.getenv("CHRISTINE_EMAIL", "christine.baylon@futurewaste.com.au")
+
+JAMES_OWNER_NAME = os.getenv("JAMES_OWNER_NAME", "James H Whelan")
+CHRISTINE_OWNER_NAME = os.getenv("CHRISTINE_OWNER_NAME", "Support Christine Jane Baylon")
+
+TICKET_PIPELINE = os.getenv("TICKET_PIPELINE", "Support Pipeline")
+TICKET_STATUS_NEW = os.getenv("TICKET_STATUS_NEW", "New Ticket")
+
+NOTE_SERVICE_REQUEST = "Please Action"
+NOTE_SPAM = "Classified as spam and closed automatically — review if this looks wrong."
+
+# TODO: confirm these against HubSpot's actual subscription dropdown once
+# you click "Create subscription" in the private app's Webhooks tab.
+CONVERSATION_CREATED_TYPE = "conversation.creation"
+INVOICE_OBJECT_TYPE_ID = os.getenv("HUBSPOT_INVOICE_OBJECT_TYPE_ID", "0-53")
+
+HEADERS = {"Authorization": f"Bearer {HUBSPOT_API_KEY}", "Content-Type": "application/json"}
+
+# ================================================================
+# LOGGING
+# ================================================================
+logger = logging.getLogger("fws_agent2")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(handler)
+
+
+def log_decision(item_id, category, actions_taken):
+    logger.info(f"item={item_id} category={category} actions={actions_taken}")
+
+
+# ================================================================
+# HUBSPOT CLIENT
+# ================================================================
+_owner_cache = {"by_name": {}, "fetched_at": 0}
+_OWNER_CACHE_TTL_SECONDS = 60 * 60
+
+
+def _refresh_owner_cache():
+    owners = {}
+    after = None
+    while True:
+        url = f"{HUBSPOT_API_BASE}/crm/v3/owners"
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+        resp = requests.get(url, headers=HEADERS, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        for owner in data.get("results", []):
+            full_name = f"{owner.get('firstName', '')} {owner.get('lastName', '')}".strip()
+            owners[full_name] = owner["id"]
+        after = data.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+    _owner_cache["by_name"] = owners
+    _owner_cache["fetched_at"] = time.time()
+
+
+def get_owner_id_by_name(display_name):
+    if not _owner_cache["by_name"] or (time.time() - _owner_cache["fetched_at"]) > _OWNER_CACHE_TTL_SECONDS:
+        _refresh_owner_cache()
+    if display_name in _owner_cache["by_name"]:
+        return _owner_cache["by_name"][display_name]
+    matches = [n for n in _owner_cache["by_name"] if display_name.lower() in n.lower()]
+    if len(matches) == 1:
+        return _owner_cache["by_name"][matches[0]]
+    raise KeyError(f"Could not resolve HubSpot owner for '{display_name}' (candidates: {matches})")
+
+
+def close_conversation(conversation_id):
+    url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}"
+    resp = requests.patch(url, headers=HEADERS, json={"status": "CLOSED"})
+    resp.raise_for_status()
+
+
+def allocate_conversation(conversation_id, owner_display_name):
+    owner_id = get_owner_id_by_name(owner_display_name)
+    url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}"
+    resp = requests.patch(url, headers=HEADERS, json={"assignedTo": f"HUBSPOT_OWNER-{owner_id}"})
+    resp.raise_for_status()
+
+
+def get_conversation_email(conversation_id):
+    url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}/messages"
+    resp = requests.get(url, headers=HEADERS, params={"limit": 1, "sort": "-createdAt"})
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if not results:
+        raise ValueError(f"No messages found for conversation {conversation_id}")
+    latest = results[0]
+    return {
+        "email_id": latest["id"],
+        "subject": latest.get("subject", ""),
+        "body": latest.get("text", latest.get("richText", "")),
+    }
+
+
+def forward_email(conversation_id, to_address, note=""):
+    """
+    TODO: not yet implemented. Decide: forward via HubSpot's conversation
+    reply endpoint (POST /conversations/v3/conversations/threads/{id}/messages),
+    or a direct email send. Currently a no-op placeholder so the rest of
+    the pipeline can run/test without crashing.
+    """
+    logger.info(f"[STUB] Would forward conversation {conversation_id} to {to_address} (note: {note})")
+
+
+def create_ticket(subject, description, owner_display_name):
+    owner_id = get_owner_id_by_name(owner_display_name)
+    url = f"{HUBSPOT_API_BASE}/crm/v3/objects/tickets"
+    payload = {
+        "properties": {
+            "subject": subject,
+            "content": description,
+            "hs_pipeline": TICKET_PIPELINE,
+            "hs_pipeline_stage": TICKET_STATUS_NEW,
+            "hubspot_owner_id": owner_id,
+            "source_type": "EMAIL",
+        }
+    }
+    resp = requests.post(url, headers=HEADERS, json=payload)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def find_company_by_type_and_name(company_type, name_hint):
+    url = f"{HUBSPOT_API_BASE}/crm/v3/objects/companies/search"
+    payload = {
+        "filterGroups": [{"filters": [
+            {"propertyName": "type", "operator": "CONTAINS_TOKEN", "value": company_type},
+            {"propertyName": "name", "operator": "CONTAINS_TOKEN", "value": name_hint},
+        ]}],
+        "properties": ["name", "type"],
+        "limit": 1,
+    }
+    resp = requests.post(url, headers=HEADERS, json=payload)
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return results[0]["id"] if results else None
+
+
+def attach_file_to_company(company_id, file_url_or_path, filename):
+    upload_url = f"{HUBSPOT_API_BASE}/filemanager/api/v3/files/upload"
+    with open(file_url_or_path, "rb") as f:
+        files = {"file": (filename, f)}
+        data = {"options": '{"access": "PRIVATE"}', "folderPath": "/invoices"}
+        resp = requests.post(upload_url, headers={"Authorization": HEADERS["Authorization"]}, files=files, data=data)
+    resp.raise_for_status()
+    file_id = resp.json()["id"]
+
+    note_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/notes"
+    note_payload = {"properties": {"hs_note_body": f"Auto-attached invoice: {filename}", "hs_attachment_ids": str(file_id)}}
+    note_resp = requests.post(note_url, headers=HEADERS, json=note_payload)
+    note_resp.raise_for_status()
+    note_id = note_resp.json()["id"]
+
+    assoc_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/notes/{note_id}/associations/default/companies/{company_id}"
+    assoc_resp = requests.put(assoc_url, headers=HEADERS)
+    assoc_resp.raise_for_status()
+
+
+def get_invoice_details(invoice_id):
+    """TODO: confirm these property names against what clv-invoice-automation
+    actually writes onto the invoice object."""
+    url = f"{HUBSPOT_API_BASE}/crm/v3/objects/invoices/{invoice_id}"
+    resp = requests.get(url, headers=HEADERS, params={
+        "properties": "hs_title,client_name,vendor_name,source_conversation_id,invoice_file_id"
+    })
+    resp.raise_for_status()
+    props = resp.json().get("properties", {})
+    return {
+        "client_name_hint": props.get("client_name", ""),
+        "vendor_name_hint": props.get("vendor_name", ""),
+        "conversation_id": props.get("source_conversation_id"),
+        "invoice_file_id": props.get("invoice_file_id"),
+    }
+
+
+# ================================================================
+# CLASSIFIER
+# ================================================================
+CLASSIFY_PROMPT = """You are classifying an email that arrived in the Sales@futurewaste.com.au
+shared inbox (viewed via HubSpot Conversations) for FutureWaste Services
+(FWS). Read the email and choose exactly ONE category:
+
+1. invoice — an SP (service provider) invoice or tax invoice. This is
+   handled by a separate upstream agent (forwarding to Veryfi for OCR) —
+   if you classify an email this way, NO ACTION should be taken here;
+   this agent's invoice-related work happens later, on a different
+   trigger.
+2. service_request — the sender is requesting a service, action, or
+   help from FWS (not simply providing information).
+3. fws_info — credit notes, payment receipts, meeting requests, or any
+   other information relevant to FWS that isn't an invoice or a service
+   request.
+4. spam — unsolicited, irrelevant, or clearly automated junk mail with
+   no legitimate business relevance.
+
+Respond with only the category name: invoice, service_request, fws_info,
+or spam.
+
+If you are not confident, prefer fws_info over spam."""
+
+VALID_CATEGORIES = {"invoice", "service_request", "fws_info", "spam"}
+
+
+def classify_email(subject, body):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=20,
+        system=CLASSIFY_PROMPT,
+        messages=[{"role": "user", "content": f"Subject: {subject}\n\nBody:\n{body}"}],
+    )
+    category = response.content[0].text.strip().lower()
+    return category if category in VALID_CATEGORIES else "fws_info"
+
+
+# ================================================================
+# ACTIONS
+# ================================================================
+def handle_service_request(email_id, conversation_id):
+    forward_email(conversation_id, CHRISTINE_EMAIL, note=NOTE_SERVICE_REQUEST)
+    allocate_conversation(conversation_id, CHRISTINE_OWNER_NAME)
+    log_decision(email_id, "service_request", ["forwarded_christine", "allocated_christine"])
+
+
+def handle_fws_info(email_id, conversation_id):
+    forward_email(conversation_id, JAMES_EMAIL)
+    allocate_conversation(conversation_id, JAMES_OWNER_NAME)
+    log_decision(email_id, "fws_info", ["forwarded_james", "allocated_james"])
+
+
+def handle_spam(email_id, conversation_id):
+    forward_email(conversation_id, CHRISTINE_EMAIL, note=NOTE_SPAM)
+    close_conversation(conversation_id)
+    log_decision(email_id, "spam", ["forwarded_christine_fyi", "closed_conversation"])
+
+
+def handle_invoice_no_action(email_id, conversation_id):
+    log_decision(email_id, "invoice", ["no_action_awaiting_invoice_created_event"])
+
+
+ACTION_MAP = {
+    "invoice": handle_invoice_no_action,
+    "service_request": handle_service_request,
+    "fws_info": handle_fws_info,
+    "spam": handle_spam,
+}
+
+
+def handle_invoice_created(invoice_id, conversation_id, client_name_hint, vendor_name_hint,
+                            invoice_file_path, invoice_filename):
+    actions_taken = []
+
+    client_company_id = find_company_by_type_and_name("Client", client_name_hint)
+    vendor_company_id = find_company_by_type_and_name("Vendor", vendor_name_hint)
+
+    if client_company_id:
+        attach_file_to_company(client_company_id, invoice_file_path, invoice_filename)
+        actions_taken.append(f"attached_file_client:{client_company_id}")
+    else:
+        actions_taken.append("client_company_not_found")
+
+    if vendor_company_id:
+        attach_file_to_company(vendor_company_id, invoice_file_path, invoice_filename)
+        actions_taken.append(f"attached_file_vendor:{vendor_company_id}")
+    else:
+        actions_taken.append("vendor_company_not_found")
+
+    if conversation_id:
+        forward_email(conversation_id, HUDOC_EMAIL)
+        actions_taken.append("forwarded_hudoc")
+        close_conversation(conversation_id)
+        actions_taken.append("closed_conversation")
+
+    ticket_id = create_ticket(
+        subject=f"SP invoice received — {invoice_id}",
+        description="Auto-created from Sales inbox. Awaiting client invoice in Xero.",
+        owner_display_name=JAMES_OWNER_NAME,
+    )
+    actions_taken.append(f"created_ticket:{ticket_id}")
+
+    log_decision(invoice_id, "invoice_created", actions_taken)
+
+
+# ================================================================
+# FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
+# ================================================================
+app = Flask(__name__)
+
+
+@app.route("/api/webhook", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "agent": "fws_agent2_hubspot_inbox"}), 200
+
+
+@app.route("/api/webhook", methods=["POST"])
+def webhook():
+    events = request.get_json(force=True)
+    if not isinstance(events, list):
+        events = [events]
+
+    results = []
+    for event in events:
+        subscription_type = event.get("subscriptionType", "")
+        try:
+            if subscription_type == CONVERSATION_CREATED_TYPE:
+                conversation_id = str(event.get("objectId"))
+                email = get_conversation_email(conversation_id)
+                category = classify_email(email["subject"], email["body"])
+                ACTION_MAP[category](email["email_id"], conversation_id)
+                results.append({"conversation_id": conversation_id, "category": category, "status": "processed"})
+
+            elif subscription_type == "object.creation" and event.get("objectTypeId") == INVOICE_OBJECT_TYPE_ID:
+                invoice_id = str(event.get("objectId"))
+                details = get_invoice_details(invoice_id)
+                handle_invoice_created(
+                    invoice_id, details["conversation_id"], details["client_name_hint"],
+                    details["vendor_name_hint"], details["invoice_file_id"], f"invoice_{invoice_id}.pdf",
+                )
+                results.append({"invoice_id": invoice_id, "status": "processed"})
+
+            else:
+                logger.info(f"Ignoring unrecognised event: {subscription_type}")
+                results.append({"status": "ignored", "subscriptionType": subscription_type})
+
+        except Exception as e:
+            logger.error(f"Error processing event {event}: {e}")
+            results.append({"status": "error", "error": str(e), "event": event})
+
+    return jsonify({"results": results}), 200
