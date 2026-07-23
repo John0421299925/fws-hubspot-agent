@@ -187,19 +187,39 @@ def attach_file_to_company(company_id, file_url_or_path, filename):
 
 
 def get_invoice_details(invoice_id):
-    """TODO: confirm these property names against what clv-invoice-automation
-    actually writes onto the invoice object."""
-    url = f"{HUBSPOT_API_BASE}/crm/v3/objects/invoices/{invoice_id}"
-    resp = requests.get(url, headers=HEADERS, params={
-        "properties": "hs_title,client_name,vendor_name,source_conversation_id,invoice_file_id"
-    })
-    resp.raise_for_status()
-    props = resp.json().get("properties", {})
+    """
+    Uses the REAL data model from clv-invoice-automation's createHubSpotInvoice():
+    - hs_title is set as "{Client Company Name} - {Supplier Name} - {Invoice Date}"
+    - Client company is linked via a v4 association (NOT a text property)
+    - Vendor/supplier is NOT associated to the invoice at all in the current
+      script, so we parse it from the title as a best-effort fallback.
+    TODO (longer-term, optional): have clv-invoice-automation also associate
+    the vendor company to the invoice, the same way it already does for the
+    client — that would remove the need for this title-parsing fallback.
+    """
+    # 1. Get the client company via the real association
+    assoc_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/invoices/{invoice_id}/associations/companies"
+    assoc_resp = requests.get(assoc_url, headers=HEADERS)
+    assoc_resp.raise_for_status()
+    assoc_results = assoc_resp.json().get("results", [])
+    client_company_id = assoc_results[0]["toObjectId"] if assoc_results else None
+
+    # 2. Get the title to parse the vendor name (best-effort) and confirm client name
+    props_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/invoices/{invoice_id}"
+    props_resp = requests.get(props_url, headers=HEADERS, params={"properties": "hs_title"})
+    props_resp.raise_for_status()
+    title = props_resp.json().get("properties", {}).get("hs_title", "")
+
+    # Title format: "{Client Name} - {Supplier Name} - {Invoice Date}"
+    parts = [p.strip() for p in title.split(" - ")]
+    vendor_name_hint = parts[1] if len(parts) >= 2 else ""
+
     return {
-        "client_name_hint": props.get("client_name", ""),
-        "vendor_name_hint": props.get("vendor_name", ""),
-        "conversation_id": props.get("source_conversation_id"),
-        "invoice_file_id": props.get("invoice_file_id"),
+        "client_company_id": client_company_id,  # direct ID — no name search needed
+        "vendor_name_hint": vendor_name_hint,      # still needs a name search, see below
+        "conversation_id": None,  # TODO: not currently stored anywhere on the invoice —
+                                   # see note in handle_invoice_created about this
+        "invoice_file_id": None,  # TODO: confirm where/if the source file is stored
     }
 
 
@@ -276,30 +296,34 @@ ACTION_MAP = {
 }
 
 
-def handle_invoice_created(invoice_id, conversation_id, client_name_hint, vendor_name_hint,
-                            invoice_file_path, invoice_filename):
+def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
+                            conversation_id, invoice_file_path, invoice_filename):
     actions_taken = []
 
-    client_company_id = find_company_by_type_and_name("Client", client_name_hint)
-    vendor_company_id = find_company_by_type_and_name("Vendor", vendor_name_hint)
-
     if client_company_id:
-        attach_file_to_company(client_company_id, invoice_file_path, invoice_filename)
-        actions_taken.append(f"attached_file_client:{client_company_id}")
+        if invoice_file_path:
+            attach_file_to_company(client_company_id, invoice_file_path, invoice_filename)
+            actions_taken.append(f"attached_file_client:{client_company_id}")
+        else:
+            actions_taken.append("client_found_but_no_file_to_attach")
     else:
         actions_taken.append("client_company_not_found")
 
+    vendor_company_id = find_company_by_type_and_name("Vendor", vendor_name_hint) if vendor_name_hint else None
     if vendor_company_id:
-        attach_file_to_company(vendor_company_id, invoice_file_path, invoice_filename)
-        actions_taken.append(f"attached_file_vendor:{vendor_company_id}")
+        if invoice_file_path:
+            attach_file_to_company(vendor_company_id, invoice_file_path, invoice_filename)
+            actions_taken.append(f"attached_file_vendor:{vendor_company_id}")
     else:
-        actions_taken.append("vendor_company_not_found")
+        actions_taken.append("vendor_company_not_found_or_no_name_hint")
 
     if conversation_id:
         forward_email(conversation_id, HUDOC_EMAIL)
         actions_taken.append("forwarded_hudoc")
         close_conversation(conversation_id)
         actions_taken.append("closed_conversation")
+    else:
+        actions_taken.append("no_conversation_id_available_skipped_forward_and_close")
 
     ticket_id = create_ticket(
         subject=f"SP invoice received — {invoice_id}",
@@ -344,8 +368,8 @@ def webhook():
                 invoice_id = str(event.get("objectId"))
                 details = get_invoice_details(invoice_id)
                 handle_invoice_created(
-                    invoice_id, details["conversation_id"], details["client_name_hint"],
-                    details["vendor_name_hint"], details["invoice_file_id"], f"invoice_{invoice_id}.pdf",
+                    invoice_id, details["client_company_id"], details["vendor_name_hint"],
+                    details["conversation_id"], details["invoice_file_id"], f"invoice_{invoice_id}.pdf",
                 )
                 results.append({"invoice_id": invoice_id, "status": "processed"})
 
