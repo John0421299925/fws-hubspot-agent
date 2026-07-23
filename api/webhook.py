@@ -36,8 +36,8 @@ NOTE_SPAM = "Classified as spam and closed automatically — review if this look
 
 # TODO: confirm these against HubSpot's actual subscription dropdown once
 # you click "Create subscription" in the private app's Webhooks tab.
-CONVERSATION_CREATED_TYPE = "conversation.creation"
-INVOICE_OBJECT_TYPE_ID = os.getenv("HUBSPOT_INVOICE_OBJECT_TYPE_ID", "0-53")
+COMMUNICATION_OBJECT_TYPE_ID = os.getenv("HUBSPOT_COMMUNICATION_OBJECT_TYPE_ID", "0-18")
+INVOICE_OBJECT_TYPE_ID = os.getenv("HUBSPOT_INVOICE_OBJECT_TYPE_ID", "0-53")  # TODO: confirm real value
 
 HEADERS = {"Authorization": f"Bearer {HUBSPOT_API_KEY}", "Content-Type": "application/json"}
 
@@ -331,15 +331,16 @@ def webhook():
     results = []
     for event in events:
         subscription_type = event.get("subscriptionType", "")
+        object_type_id = event.get("objectTypeId", "")
         try:
-            if subscription_type == CONVERSATION_CREATED_TYPE:
+            if subscription_type == "object.creation" and object_type_id == COMMUNICATION_OBJECT_TYPE_ID:
                 conversation_id = str(event.get("objectId"))
                 email = get_conversation_email(conversation_id)
                 category = classify_email(email["subject"], email["body"])
                 ACTION_MAP[category](email["email_id"], conversation_id)
                 results.append({"conversation_id": conversation_id, "category": category, "status": "processed"})
 
-            elif subscription_type == "object.creation" and event.get("objectTypeId") == INVOICE_OBJECT_TYPE_ID:
+            elif subscription_type == "object.creation" and object_type_id == INVOICE_OBJECT_TYPE_ID:
                 invoice_id = str(event.get("objectId"))
                 details = get_invoice_details(invoice_id)
                 handle_invoice_created(
