@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.3
+Version: v1.4
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -20,12 +20,15 @@ Version history:
          vendor isn't associated to the invoice in clv-invoice-automation
          yet. Fixes the 400 Bad Request from searching companies with an
          empty name value.
-  v1.3 - Fixed create_ticket(): removed hs_pipeline/hs_pipeline_stage
-         (were sending display labels "Support Pipeline"/"New Ticket",
-         but HubSpot's Tickets API requires internal numeric IDs for
-         these — caused a 400 Bad Request). Ticket now lands in HubSpot's
-         default pipeline; can add the specific pipeline back once real
-         IDs are confirmed.
+  v1.3 - Removed hs_pipeline/hs_pipeline_stage from ticket creation
+         (were sending display labels, not valid IDs) — turned out these
+         fields are actually REQUIRED, so this just traded one 400 error
+         for another. Superseded by v1.4.
+  v1.4 - Fixed properly: fetches real pipeline/stage IDs at runtime via
+         /crm/v3/pipelines/tickets, matching TICKET_PIPELINE/
+         TICKET_STATUS_NEW by label (falls back to the account's first
+         pipeline/stage if no label match). Cached for 1 hour, same
+         pattern as owner-name resolution.
 """
 import os
 import time
@@ -154,24 +157,55 @@ def forward_email(conversation_id, to_address, note=""):
     logger.info(f"[STUB] Would forward conversation {conversation_id} to {to_address} (note: {note})")
 
 
+_pipeline_cache = {"pipeline_id": None, "stage_id": None, "fetched_at": 0}
+_PIPELINE_CACHE_TTL_SECONDS = 60 * 60
+
+
+def _get_default_ticket_pipeline_and_stage():
+    """
+    HubSpot's Tickets API requires internal numeric IDs for hs_pipeline
+    and hs_pipeline_stage (display labels like "Support Pipeline" cause a
+    400 Bad Request). Rather than guess these, fetch them for real at
+    runtime and cache them — mirrors the owner-name caching pattern above.
+    Picks the pipeline matching TICKET_PIPELINE by label if found,
+    otherwise falls back to the account's first/default pipeline, and
+    takes that pipeline's first stage.
+    """
+    if _pipeline_cache["pipeline_id"] and (time.time() - _pipeline_cache["fetched_at"]) < _PIPELINE_CACHE_TTL_SECONDS:
+        return _pipeline_cache["pipeline_id"], _pipeline_cache["stage_id"]
+
+    url = f"{HUBSPOT_API_BASE}/crm/v3/pipelines/tickets"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    pipelines = resp.json().get("results", [])
+    if not pipelines:
+        raise ValueError("No ticket pipelines found on this HubSpot account")
+
+    match = next((p for p in pipelines if p.get("label") == TICKET_PIPELINE), None)
+    chosen = match or pipelines[0]
+
+    stages = chosen.get("stages", [])
+    if not stages:
+        raise ValueError(f"Pipeline '{chosen.get('label')}' has no stages")
+    stage_match = next((s for s in stages if s.get("label") == TICKET_STATUS_NEW), None)
+    chosen_stage = stage_match or stages[0]
+
+    _pipeline_cache["pipeline_id"] = chosen["id"]
+    _pipeline_cache["stage_id"] = chosen_stage["id"]
+    _pipeline_cache["fetched_at"] = time.time()
+    return chosen["id"], chosen_stage["id"]
+
+
 def create_ticket(subject, description, owner_display_name):
-    """
-    NOTE: hs_pipeline / hs_pipeline_stage are deliberately omitted.
-    HubSpot's Tickets API requires internal numeric IDs for these (not
-    display labels like "Support Pipeline" or "New Ticket" — sending
-    labels causes a 400 Bad Request). Omitting them lets the ticket land
-    in HubSpot's default pipeline/stage, which is fully functional.
-    TODO: once you confirm the real pipeline/stage IDs (Settings > Objects
-    > Tickets > Pipelines in HubSpot, or via the /crm/v3/pipelines/tickets
-    API), we can add them back to file these under "Support Pipeline"
-    specifically.
-    """
     owner_id = get_owner_id_by_name(owner_display_name)
+    pipeline_id, stage_id = _get_default_ticket_pipeline_and_stage()
     url = f"{HUBSPOT_API_BASE}/crm/v3/objects/tickets"
     payload = {
         "properties": {
             "subject": subject,
             "content": description,
+            "hs_pipeline": pipeline_id,
+            "hs_pipeline_stage": stage_id,
             "hubspot_owner_id": owner_id,
             "source_type": "EMAIL",
         }
@@ -366,7 +400,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.3"
+VERSION = "v1.4"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
