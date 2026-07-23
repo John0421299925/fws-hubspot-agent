@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.4
+Version: v1.5
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -29,6 +29,21 @@ Version history:
          TICKET_STATUS_NEW by label (falls back to the account's first
          pipeline/stage if no label match). Cached for 1 hour, same
          pattern as owner-name resolution.
+  v1.5 - No more errors, but client_company_id and vendor_name_hint came
+         back empty on a real invoice. Two real fixes:
+         (a) client company association: added retry with short backoff,
+         since the invoice-created webhook fires before
+         clv-invoice-automation finishes its line-items loop and THEN
+         associates the client company — a genuine race condition, not a
+         wrong query.
+         (b) vendor name: disabled the title-parsing approach entirely.
+         It relied on splitting "{Client} - {Supplier} - {Date}", but a
+         real client name ("Campus Living Villages - Sydney University")
+         itself contains " - ", which broke the split and could have
+         silently attached the file to the wrong company. Left blank
+         until there's a reliable source (ideally clv-invoice-automation
+         associating the vendor company directly, like it does for
+         client).
 """
 import os
 import time
@@ -258,30 +273,46 @@ def get_invoice_details(invoice_id):
     - Client company is linked via a v4 association (NOT a text property)
     - Vendor/supplier is NOT associated to the invoice at all in the current
       script, so we parse it from the title as a best-effort fallback.
-    TODO (longer-term, optional): have clv-invoice-automation also associate
-    the vendor company to the invoice, the same way it already does for the
-    client — that would remove the need for this title-parsing fallback.
+
+    NOTE: the invoice-created webhook fires the instant the invoice object
+    itself is created — but clv-invoice-automation associates the client
+    company AFTER looping through all line items (which can be 40+ API
+    calls for a big invoice). So the association may genuinely not exist
+    yet when this first runs. We retry a few times with short waits before
+    giving up, rather than failing immediately on an empty result.
+
+    TODO (longer-term, optional): have clv-invoice-automation associate
+    the client (and ideally vendor) company immediately after creating the
+    invoice record, before the line-items loop — would remove this race
+    condition at the source instead of working around it here.
     """
-    # 1. Get the client company via the real association
-    assoc_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/invoices/{invoice_id}/associations/companies"
-    assoc_resp = requests.get(assoc_url, headers=HEADERS)
-    assoc_resp.raise_for_status()
-    assoc_results = assoc_resp.json().get("results", [])
-    client_company_id = assoc_results[0]["toObjectId"] if assoc_results else None
+    client_company_id = None
+    for attempt in range(4):  # ~0 + 2 + 4 + 6 = 12s max wait, safe under Vercel's timeout
+        assoc_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/invoices/{invoice_id}/associations/companies"
+        assoc_resp = requests.get(assoc_url, headers=HEADERS)
+        assoc_resp.raise_for_status()
+        assoc_results = assoc_resp.json().get("results", [])
+        if assoc_results:
+            client_company_id = assoc_results[0]["toObjectId"]
+            break
+        if attempt < 3:
+            logger.info(f"No company association yet for invoice {invoice_id}, retrying (attempt {attempt + 1}/4)...")
+            time.sleep(2 * (attempt + 1))
 
-    # 2. Get the title to parse the vendor name (best-effort) and confirm client name
-    props_url = f"{HUBSPOT_API_BASE}/crm/v3/objects/invoices/{invoice_id}"
-    props_resp = requests.get(props_url, headers=HEADERS, params={"properties": "hs_title"})
-    props_resp.raise_for_status()
-    title = props_resp.json().get("properties", {}).get("hs_title", "")
-
-    # Title format: "{Client Name} - {Supplier Name} - {Invoice Date}"
-    parts = [p.strip() for p in title.split(" - ")]
-    vendor_name_hint = parts[1] if len(parts) >= 2 else ""
+    # NOTE: vendor name parsing from the title was tried and deliberately
+    # disabled. Title format is "{Client} - {Supplier} - {Date}", but real
+    # client names can themselves contain " - " (e.g. "Campus Living
+    # Villages - Sydney University"), which breaks a naive split and could
+    # silently attach the invoice file to the WRONG company. Safer to skip
+    # vendor attachment entirely until there's a reliable source for it.
+    # TODO: the real fix is having clv-invoice-automation associate the
+    # vendor company to the invoice directly (same as it already does for
+    # client), removing the need to parse anything from the title at all.
+    vendor_name_hint = ""
 
     return {
-        "client_company_id": client_company_id,  # direct ID — no name search needed
-        "vendor_name_hint": vendor_name_hint,      # still needs a name search, see below
+        "client_company_id": client_company_id,
+        "vendor_name_hint": vendor_name_hint,
         "conversation_id": None,  # TODO: not currently stored anywhere on the invoice —
                                    # see note in handle_invoice_created about this
         "invoice_file_id": None,  # TODO: confirm where/if the source file is stored
@@ -400,7 +431,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.4"
+VERSION = "v1.5"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
