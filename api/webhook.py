@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.2
+Version: v1.3
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -20,6 +20,12 @@ Version history:
          vendor isn't associated to the invoice in clv-invoice-automation
          yet. Fixes the 400 Bad Request from searching companies with an
          empty name value.
+  v1.3 - Fixed create_ticket(): removed hs_pipeline/hs_pipeline_stage
+         (were sending display labels "Support Pipeline"/"New Ticket",
+         but HubSpot's Tickets API requires internal numeric IDs for
+         these — caused a 400 Bad Request). Ticket now lands in HubSpot's
+         default pipeline; can add the specific pipeline back once real
+         IDs are confirmed.
 """
 import os
 import time
@@ -149,14 +155,23 @@ def forward_email(conversation_id, to_address, note=""):
 
 
 def create_ticket(subject, description, owner_display_name):
+    """
+    NOTE: hs_pipeline / hs_pipeline_stage are deliberately omitted.
+    HubSpot's Tickets API requires internal numeric IDs for these (not
+    display labels like "Support Pipeline" or "New Ticket" — sending
+    labels causes a 400 Bad Request). Omitting them lets the ticket land
+    in HubSpot's default pipeline/stage, which is fully functional.
+    TODO: once you confirm the real pipeline/stage IDs (Settings > Objects
+    > Tickets > Pipelines in HubSpot, or via the /crm/v3/pipelines/tickets
+    API), we can add them back to file these under "Support Pipeline"
+    specifically.
+    """
     owner_id = get_owner_id_by_name(owner_display_name)
     url = f"{HUBSPOT_API_BASE}/crm/v3/objects/tickets"
     payload = {
         "properties": {
             "subject": subject,
             "content": description,
-            "hs_pipeline": TICKET_PIPELINE,
-            "hs_pipeline_stage": TICKET_STATUS_NEW,
             "hubspot_owner_id": owner_id,
             "source_type": "EMAIL",
         }
@@ -351,7 +366,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.2"
+VERSION = "v1.3"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
