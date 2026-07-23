@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.6
+Version: v1.7
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -50,6 +50,16 @@ Version history:
          (~30s max wait). Also added maxDuration: 60 to vercel.json, since
          Vercel would otherwise kill the function before the retries
          could finish.
+  v1.7 - Found the real root cause of Communication events never firing:
+         HubSpot's own docs confirm generic/expanded-object webhooks do
+         NOT support conversation.* events — they require the legacy
+         webhook format instead. Created a separate legacy "Conversation"
+         subscription (subscriptionType: "conversation.creation", no
+         objectTypeId, objectId is the conversation ID directly) and
+         added a matching branch. The old Communication/expanded-object
+         branch is left in place but will likely never fire real events
+         — harmless to leave, real traffic should come through the new
+         conversation.creation branch instead.
 """
 import os
 import time
@@ -442,7 +452,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.6"
+VERSION = "v1.7"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
@@ -466,7 +476,18 @@ def webhook():
         subscription_type = event.get("subscriptionType", "")
         object_type_id = event.get("objectTypeId", "")
         try:
-            if subscription_type == "object.creation" and object_type_id == COMMUNICATION_OBJECT_TYPE_ID:
+            if subscription_type == "conversation.creation":
+                # Legacy format — HubSpot's docs confirm conversation.*
+                # events aren't supported under the new expanded/generic
+                # object model, so this arrives differently to Invoice
+                # (no objectTypeId at all, just a direct conversation ID).
+                conversation_id = str(event.get("objectId"))
+                email = get_conversation_email(conversation_id)
+                category = classify_email(email["subject"], email["body"])
+                ACTION_MAP[category](email["email_id"], conversation_id)
+                results.append({"conversation_id": conversation_id, "category": category, "status": "processed"})
+
+            elif subscription_type == "object.creation" and object_type_id == COMMUNICATION_OBJECT_TYPE_ID:
                 conversation_id = str(event.get("objectId"))
                 email = get_conversation_email(conversation_id)
                 category = classify_email(email["subject"], email["body"])
