@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.7
+Version: v1.8
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -60,6 +60,14 @@ Version history:
          branch is left in place but will likely never fire real events
          — harmless to leave, real traffic should come through the new
          conversation.creation branch instead.
+  v1.8 - First real email successfully classified end-to-end (category
+         fws_info, correctly routed to forward-to-James). Failed on the
+         next step: allocate_conversation got a 400 Bad Request with no
+         visible reason. Added _raise_with_body() to log HubSpot's actual
+         error response text before raising, instead of the generic
+         'Bad Request' message that hides what HubSpot really
+         complained about. No functional fix yet — need to see the real
+         error body on the next test to know what to actually fix.
 """
 import os
 import time
@@ -150,17 +158,27 @@ def get_owner_id_by_name(display_name):
     raise KeyError(f"Could not resolve HubSpot owner for '{display_name}' (candidates: {matches})")
 
 
+def _raise_with_body(resp):
+    """Log HubSpot's actual error response body before raising, so we can
+    see the real reason for a 400/403/etc instead of just the generic
+    'Bad Request for url: ...' message that hides what HubSpot actually
+    complained about."""
+    if not resp.ok:
+        logger.error(f"HubSpot API error {resp.status_code} for {resp.url}: {resp.text}")
+    resp.raise_for_status()
+
+
 def close_conversation(conversation_id):
     url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}"
     resp = requests.patch(url, headers=HEADERS, json={"status": "CLOSED"})
-    resp.raise_for_status()
+    _raise_with_body(resp)
 
 
 def allocate_conversation(conversation_id, owner_display_name):
     owner_id = get_owner_id_by_name(owner_display_name)
     url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}"
     resp = requests.patch(url, headers=HEADERS, json={"assignedTo": f"HUBSPOT_OWNER-{owner_id}"})
-    resp.raise_for_status()
+    _raise_with_body(resp)
 
 
 def get_conversation_email(conversation_id):
@@ -452,7 +470,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.7"
+VERSION = "v1.8"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
