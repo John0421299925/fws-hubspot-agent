@@ -1,9 +1,25 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
+Version: v1.2
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
 files and folders. This is the file Vercel runs.
+
+Version history:
+  v1.0 - Initial deploy. Guessed subscriptionType 'conversation.creation'
+         (wrong) and invoice properties 'client_name'/'vendor_name' (wrong).
+  v1.1 - Fixed event routing: both Communication and Invoice events arrive
+         as subscriptionType 'object.creation', distinguished by
+         objectTypeId ('0-18' for Communication, '0-53' for Invoice) —
+         confirmed against real HubSpot sample payloads.
+  v1.2 - Fixed get_invoice_details(): client company now fetched via the
+         real v4 association (not a guessed 'client_name' property);
+         vendor name parsed from hs_title's real format
+         "{Client} - {Supplier} - {Date}" as a best-effort fallback since
+         vendor isn't associated to the invoice in clv-invoice-automation
+         yet. Fixes the 400 Bad Request from searching companies with an
+         empty name value.
 """
 import os
 import time
@@ -335,6 +351,8 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
+VERSION = "v1.2"
+
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
 # ================================================================
@@ -343,7 +361,7 @@ app = Flask(__name__)
 
 @app.route("/api/webhook", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "agent": "fws_agent2_hubspot_inbox"}), 200
+    return jsonify({"status": "ok", "agent": "fws_agent2_hubspot_inbox", "version": VERSION}), 200
 
 
 @app.route("/api/webhook", methods=["POST"])
