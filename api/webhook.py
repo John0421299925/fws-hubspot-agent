@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.5
+Version: v1.6
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -44,6 +44,12 @@ Version history:
          until there's a reliable source (ideally clv-invoice-automation
          associating the vendor company directly, like it does for
          client).
+  v1.6 - v1.5's retry window (~12s) still wasn't long enough — the
+         original webhook's real timing (line items + association) takes
+         30-40+ seconds for larger invoices. Extended to 7 attempts x 5s
+         (~30s max wait). Also added maxDuration: 60 to vercel.json, since
+         Vercel would otherwise kill the function before the retries
+         could finish.
 """
 import os
 import time
@@ -287,7 +293,12 @@ def get_invoice_details(invoice_id):
     condition at the source instead of working around it here.
     """
     client_company_id = None
-    for attempt in range(4):  # ~0 + 2 + 4 + 6 = 12s max wait, safe under Vercel's timeout
+    # The original invoice webhook's own timing (line items loop + company
+    # association) regularly takes 30-40+ seconds for larger invoices, so a
+    # short retry window isn't enough — 6 attempts with 5s waits gives ~30s
+    # total, which should cover most cases while staying safely under
+    # Vercel's function timeout.
+    for attempt in range(7):
         assoc_url = f"{HUBSPOT_API_BASE}/crm/v4/objects/invoices/{invoice_id}/associations/companies"
         assoc_resp = requests.get(assoc_url, headers=HEADERS)
         assoc_resp.raise_for_status()
@@ -295,9 +306,9 @@ def get_invoice_details(invoice_id):
         if assoc_results:
             client_company_id = assoc_results[0]["toObjectId"]
             break
-        if attempt < 3:
-            logger.info(f"No company association yet for invoice {invoice_id}, retrying (attempt {attempt + 1}/4)...")
-            time.sleep(2 * (attempt + 1))
+        if attempt < 6:
+            logger.info(f"No company association yet for invoice {invoice_id}, retrying (attempt {attempt + 1}/7)...")
+            time.sleep(5)
 
     # NOTE: vendor name parsing from the title was tried and deliberately
     # disabled. Title format is "{Client} - {Supplier} - {Date}", but real
@@ -431,7 +442,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.5"
+VERSION = "v1.6"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
