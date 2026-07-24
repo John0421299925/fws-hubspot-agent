@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.14
+Version: v1.15
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -116,6 +116,15 @@ Version history:
          — meaning the classifier may have been receiving a blank body
          in some cases without anyone noticing. Fixed to properly treat
          an empty text field the same as a missing one.
+  v1.15 - The v1.14 diagnostic revealed subject AND body are BOTH still
+         completely empty even after the fallback fix — meaning
+         classification has effectively been blind this whole time, just
+         landing on "fws_info" by default and getting lucky/unlucky
+         rather than actually reading email content. Added full raw
+         message object logging to see every field HubSpot actually
+         returns, since neither "text", "richText", nor "subject" are
+         populated the way expected — need to find the real field
+         name(s) before this can be fixed properly.
 """
 import os
 import time
@@ -244,6 +253,7 @@ def get_conversation_email(conversation_id):
     if not results:
         raise ValueError(f"No messages found for conversation {conversation_id}")
     latest = results[0]
+    logger.info(f"Raw message object for conversation {conversation_id}: {latest}")
     body = latest.get("text") or latest.get("richText") or ""
     return {
         "email_id": latest["id"],
@@ -562,7 +572,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.14"
+VERSION = "v1.15"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
