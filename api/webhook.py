@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.15
+Version: v1.16
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -125,6 +125,17 @@ Version history:
          returns, since neither "text", "richText", nor "subject" are
          populated the way expected — need to find the real field
          name(s) before this can be fixed properly.
+  v1.16 - Found it: the raw log showed "type": "ASSIGNMENT" — we were
+         fetching the newest item in the thread by createdAt, but the
+         newest item is often HubSpot's own SYSTEM event for the
+         automatic default-assignment-to-Christine (fires milliseconds
+         after the real email arrives), not the actual email message.
+         Every classification up to this point was effectively
+         classifying blank content and defaulting to "fws_info" by luck.
+         Fixed: fetch several recent items and specifically find the one
+         with type == "MESSAGE", ignoring system events like ASSIGNMENT.
+         Verified against a mocked realistic scenario (ASSIGNMENT +
+         MESSAGE together) — correctly picks the real message now.
 """
 import os
 import time
@@ -247,17 +258,27 @@ def allocate_conversation(conversation_id, owner_display_name):
 
 def get_conversation_email(conversation_id):
     url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}/messages"
-    resp = requests.get(url, headers=HEADERS, params={"limit": 1, "sort": "-createdAt"})
+    resp = requests.get(url, headers=HEADERS, params={"limit": 10, "sort": "-createdAt"})
     resp.raise_for_status()
     results = resp.json().get("results", [])
     if not results:
         raise ValueError(f"No messages found for conversation {conversation_id}")
-    latest = results[0]
-    logger.info(f"Raw message object for conversation {conversation_id}: {latest}")
-    body = latest.get("text") or latest.get("richText") or ""
+
+    # The newest item isn't necessarily the actual email — HubSpot logs
+    # system events (e.g. type "ASSIGNMENT" for the automatic default
+    # assignment to Christine) in the same thread, often milliseconds
+    # after the real message arrives. Find the actual message, not just
+    # take index 0.
+    email_message = next((m for m in results if m.get("type") == "MESSAGE"), None)
+    if not email_message:
+        logger.info(f"No 'MESSAGE' type found for conversation {conversation_id}, raw types seen: {[m.get('type') for m in results]}")
+        raise ValueError(f"No actual email message found for conversation {conversation_id} (only system events)")
+
+    logger.info(f"Real message object for conversation {conversation_id}: {email_message}")
+    body = email_message.get("text") or email_message.get("richText") or ""
     return {
-        "email_id": latest["id"],
-        "subject": latest.get("subject", ""),
+        "email_id": email_message["id"],
+        "subject": email_message.get("subject", ""),
         "body": body,
     }
 
@@ -572,7 +593,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.15"
+VERSION = "v1.16"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
