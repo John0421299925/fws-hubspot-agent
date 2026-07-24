@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.10
+Version: v1.11
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -87,6 +87,12 @@ Version history:
          guess these (and likely repeat the multi-round guessing cycle we
          went through with the ticket pipeline IDs), fetch them for real
          first, then implement the actual send in the next version.
+  v1.11 - Implemented forward_email() for real using the discovered IDs:
+         channelId "1002" (EMAIL), channelAccountId "2083221560"
+         (sales@futurewaste.com.au), senderActorId "A-46606016" (this
+         app's own ID, following HubSpot's documented app-actor pattern).
+         Not yet confirmed against a real successful send — first real
+         test will tell us if senderActorId format is right.
 """
 import os
 import time
@@ -222,14 +228,38 @@ def get_conversation_email(conversation_id):
     }
 
 
+# Real values discovered via /api/webhook/debug/channels — specific to
+# this HubSpot account's Sales@futurewaste.com.au inbox.
+EMAIL_CHANNEL_ID = "1002"
+SALES_CHANNEL_ACCOUNT_ID = "2083221560"
+SENDER_ACTOR_ID = f"A-{os.getenv('HUBSPOT_APP_ID', '46606016')}"
+
+
 def forward_email(conversation_id, to_address, note=""):
     """
-    TODO: not yet implemented. Decide: forward via HubSpot's conversation
-    reply endpoint (POST /conversations/v3/conversations/threads/{id}/messages),
-    or a direct email send. Currently a no-op placeholder so the rest of
-    the pipeline can run/test without crashing.
+    Sends a message into the thread addressed to to_address, using
+    HubSpot's Conversations API. Uses the real channel/account IDs for
+    the Sales@futurewaste.com.au inbox (discovered via the debug
+    endpoint) rather than guessed values.
+    TODO: senderActorId format ("A-{appId}") is based on HubSpot's
+    documented pattern for app-based senders, but hasn't been confirmed
+    against a real successful send yet — first real test will confirm.
     """
-    logger.info(f"[STUB] Would forward conversation {conversation_id} to {to_address} (note: {note})")
+    text = f"{note}\n\n---\nForwarded by FWS Agent 2." if note else "Forwarded by FWS Agent 2."
+    url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}/messages"
+    payload = {
+        "type": "MESSAGE",
+        "text": text,
+        "senderActorId": SENDER_ACTOR_ID,
+        "channelId": EMAIL_CHANNEL_ID,
+        "channelAccountId": SALES_CHANNEL_ACCOUNT_ID,
+        "recipients": [
+            {"deliveryIdentifier": {"type": "HS_EMAIL_ADDRESS", "value": to_address}}
+        ],
+    }
+    resp = requests.post(url, headers=HEADERS, json=payload)
+    _raise_with_body(resp)
+    logger.info(f"Forwarded conversation {conversation_id} to {to_address}")
 
 
 _pipeline_cache = {"pipeline_id": None, "stage_id": None, "fetched_at": 0}
@@ -504,7 +534,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.10"
+VERSION = "v1.11"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
