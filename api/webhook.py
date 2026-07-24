@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.11
+Version: v1.12
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -93,6 +93,12 @@ Version history:
          app's own ID, following HubSpot's documented app-actor pattern).
          Not yet confirmed against a real successful send — first real
          test will tell us if senderActorId format is right.
+  v1.12 - Got the real error: "Sender actor A-46606016 not found".
+         HubSpot's docs confirm senderActorId must be a real HubSpot
+         USER's ID, not an app ID — "an agent actor ID that is
+         associated to the HubSpot user in the account who is sending
+         the message." Fixed to resolve Christine's owner ID at runtime
+         (via the existing owner-name cache) and use that instead.
 """
 import os
 import time
@@ -232,25 +238,25 @@ def get_conversation_email(conversation_id):
 # this HubSpot account's Sales@futurewaste.com.au inbox.
 EMAIL_CHANNEL_ID = "1002"
 SALES_CHANNEL_ACCOUNT_ID = "2083221560"
-SENDER_ACTOR_ID = f"A-{os.getenv('HUBSPOT_APP_ID', '46606016')}"
 
 
 def forward_email(conversation_id, to_address, note=""):
     """
     Sends a message into the thread addressed to to_address, using
-    HubSpot's Conversations API. Uses the real channel/account IDs for
-    the Sales@futurewaste.com.au inbox (discovered via the debug
-    endpoint) rather than guessed values.
-    TODO: senderActorId format ("A-{appId}") is based on HubSpot's
-    documented pattern for app-based senders, but hasn't been confirmed
-    against a real successful send yet — first real test will confirm.
+    HubSpot's Conversations API. senderActorId must be a real HubSpot
+    USER's actor ID (format "A-{userId}") — confirmed via HubSpot's docs
+    and community reports that this cannot be an app ID, it must be "an
+    agent actor ID that is associated to the HubSpot user in the account
+    who is sending the message." Using Christine's owner ID (she's the
+    default inbox owner) via the existing owner-resolution cache.
     """
+    sender_owner_id = get_owner_id_by_name(CHRISTINE_OWNER_NAME)
     text = f"{note}\n\n---\nForwarded by FWS Agent 2." if note else "Forwarded by FWS Agent 2."
     url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}/messages"
     payload = {
         "type": "MESSAGE",
         "text": text,
-        "senderActorId": SENDER_ACTOR_ID,
+        "senderActorId": f"A-{sender_owner_id}",
         "channelId": EMAIL_CHANNEL_ID,
         "channelAccountId": SALES_CHANNEL_ACCOUNT_ID,
         "recipients": [
@@ -534,7 +540,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.11"
+VERSION = "v1.12"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
