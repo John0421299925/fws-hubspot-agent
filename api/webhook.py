@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.13
+Version: v1.14
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -104,6 +104,18 @@ Version history:
          exactly: "deliveryIdentifiers" (plural, array) instead of
          "deliveryIdentifier" (singular), plus an explicit
          "recipientField": "TO" to mark it as the To recipient.
+         Forwarding confirmed genuinely working end-to-end on a real
+         spam test (email actually arrived in Christine's Outlook).
+  v1.14 - A "Credit note CN-4521" test email got classified as spam
+         instead of the expected fws_info — investigating rather than
+         guessing. Added logging of the exact subject/body sent to
+         Claude for classification, so we can see what it actually
+         received. Also fixed a subtle bug in body extraction: the old
+         `.get("text", fallback)` only falls back to richText if the
+         "text" KEY is missing, not if it exists but is an EMPTY STRING
+         — meaning the classifier may have been receiving a blank body
+         in some cases without anyone noticing. Fixed to properly treat
+         an empty text field the same as a missing one.
 """
 import os
 import time
@@ -232,10 +244,11 @@ def get_conversation_email(conversation_id):
     if not results:
         raise ValueError(f"No messages found for conversation {conversation_id}")
     latest = results[0]
+    body = latest.get("text") or latest.get("richText") or ""
     return {
         "email_id": latest["id"],
         "subject": latest.get("subject", ""),
-        "body": latest.get("text", latest.get("richText", "")),
+        "body": body,
     }
 
 
@@ -457,6 +470,7 @@ VALID_CATEGORIES = {"invoice", "service_request", "fws_info", "spam"}
 
 
 def classify_email(subject, body):
+    logger.info(f"Classifying — subject: {subject!r} | body: {body!r}")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
         model="claude-sonnet-4-6",
@@ -548,7 +562,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.13"
+VERSION = "v1.14"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
