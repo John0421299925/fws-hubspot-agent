@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.8
+Version: v1.9
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -68,6 +68,17 @@ Version history:
          'Bad Request' message that hides what HubSpot really
          complained about. No functional fix yet — need to see the real
          error body on the next test to know what to actually fix.
+  v1.9 - Got the real error: "EMPTY_UPDATE_REQUEST_BODY" — confirmed via
+         HubSpot's own docs and multiple community threads that the
+         Conversations API's PATCH endpoint ONLY supports updating
+         status (open/closed), NOT assigning an owner. This is a genuine
+         platform limitation, not a bug on our end — there is no public
+         API way to do this. Removed allocate_conversation() calls from
+         service_request/fws_info; they now rely solely on the forwarded
+         email (with its note) to alert Christine/James, who'll need to
+         manually claim the conversation in HubSpot. A HubSpot Workflow
+         ("Assign conversation owner" action, needs Service/Data Hub
+         Pro+) could replace this from HubSpot's side if wanted later.
 """
 import os
 import time
@@ -175,6 +186,13 @@ def close_conversation(conversation_id):
 
 
 def allocate_conversation(conversation_id, owner_display_name):
+    """
+    NOT CURRENTLY USED — kept for reference only. HubSpot's Conversations
+    API does not support assigning an owner via this PATCH endpoint (their
+    own docs confirm only status updates/restores are supported here);
+    calling this will fail with EMPTY_UPDATE_REQUEST_BODY. See the note
+    in handle_service_request/handle_fws_info for the actual approach.
+    """
     owner_id = get_owner_id_by_name(owner_display_name)
     url = f"{HUBSPOT_API_BASE}/conversations/v3/conversations/threads/{conversation_id}"
     resp = requests.patch(url, headers=HEADERS, json={"assignedTo": f"HUBSPOT_OWNER-{owner_id}"})
@@ -403,14 +421,22 @@ def classify_email(subject, body):
 # ================================================================
 def handle_service_request(email_id, conversation_id):
     forward_email(conversation_id, CHRISTINE_EMAIL, note=NOTE_SERVICE_REQUEST)
-    allocate_conversation(conversation_id, CHRISTINE_OWNER_NAME)
-    log_decision(email_id, "service_request", ["forwarded_christine", "allocated_christine"])
+    # NOTE: allocate_conversation() removed — HubSpot's own docs confirm
+    # the Conversations API only supports updating a thread's status via
+    # PATCH, NOT assigning an owner. This isn't a bug, it's a genuine
+    # platform limitation (confirmed via multiple HubSpot community
+    # threads reporting the same "EMPTY_UPDATE_REQUEST_BODY" error).
+    # Christine gets the forwarded email with the "Please Action" note;
+    # she'll need to manually claim the conversation in HubSpot rather
+    # than have it pre-assigned. A HubSpot Workflow ("Assign conversation
+    # owner" action, needs Service/Data Hub Pro+) could do this from the
+    # HubSpot side if that becomes worth setting up later.
+    log_decision(email_id, "service_request", ["forwarded_christine"])
 
 
 def handle_fws_info(email_id, conversation_id):
     forward_email(conversation_id, JAMES_EMAIL)
-    allocate_conversation(conversation_id, JAMES_OWNER_NAME)
-    log_decision(email_id, "fws_info", ["forwarded_james", "allocated_james"])
+    log_decision(email_id, "fws_info", ["forwarded_james"])
 
 
 def handle_spam(email_id, conversation_id):
@@ -470,7 +496,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.8"
+VERSION = "v1.9"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
