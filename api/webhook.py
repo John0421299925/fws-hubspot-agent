@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.12
+Version: v1.13
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -99,6 +99,11 @@ Version history:
          associated to the HubSpot user in the account who is sending
          the message." Fixed to resolve Christine's owner ID at runtime
          (via the existing owner-name cache) and use that instead.
+  v1.13 - Sender fixed, but got MISSING_TO_RECIPIENT next. Fixed the
+         recipient structure to match HubSpot's documented format
+         exactly: "deliveryIdentifiers" (plural, array) instead of
+         "deliveryIdentifier" (singular), plus an explicit
+         "recipientField": "TO" to mark it as the To recipient.
 """
 import os
 import time
@@ -260,7 +265,10 @@ def forward_email(conversation_id, to_address, note=""):
         "channelId": EMAIL_CHANNEL_ID,
         "channelAccountId": SALES_CHANNEL_ACCOUNT_ID,
         "recipients": [
-            {"deliveryIdentifier": {"type": "HS_EMAIL_ADDRESS", "value": to_address}}
+            {
+                "recipientField": "TO",
+                "deliveryIdentifiers": [{"type": "HS_EMAIL_ADDRESS", "value": to_address}],
+            }
         ],
     }
     resp = requests.post(url, headers=HEADERS, json=payload)
@@ -540,7 +548,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.12"
+VERSION = "v1.13"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
