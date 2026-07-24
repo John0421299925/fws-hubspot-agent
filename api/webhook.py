@@ -1,6 +1,6 @@
 """
 FWS Agent 2 — HubSpot Inbox Agent (consolidated single-file version)
-Version: v1.9
+Version: v1.10
 
 Everything Agent 2 needs is in this one file, deliberately, so it's easy
 to copy-paste into a single GitHub file rather than managing many small
@@ -79,6 +79,14 @@ Version history:
          manually claim the conversation in HubSpot. A HubSpot Workflow
          ("Assign conversation owner" action, needs Service/Data Hub
          Pro+) could replace this from HubSpot's side if wanted later.
+  v1.10 - Added a one-time discovery endpoint (/api/webhook/debug/channels)
+         to fetch the real inbox/channel/channel-account IDs needed to
+         implement forward_email() for real. Sending a message via the
+         Conversations API needs a senderActorId, channelId, and
+         channelAccountId specific to this HubSpot account — rather than
+         guess these (and likely repeat the multi-round guessing cycle we
+         went through with the ticket pipeline IDs), fetch them for real
+         first, then implement the actual send in the next version.
 """
 import os
 import time
@@ -496,7 +504,7 @@ def handle_invoice_created(invoice_id, client_company_id, vendor_name_hint,
     log_decision(invoice_id, "invoice_created", actions_taken)
 
 
-VERSION = "v1.9"
+VERSION = "v1.10"
 
 # ================================================================
 # FLASK APP — Vercel's Python runtime looks for a WSGI app named `app`
@@ -507,6 +515,28 @@ app = Flask(__name__)
 @app.route("/api/webhook", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok", "agent": "fws_agent2_hubspot_inbox", "version": VERSION}), 200
+
+
+@app.route("/api/webhook/debug/channels", methods=["GET"])
+def debug_channels():
+    """
+    One-time discovery endpoint: fetches the real inbox/channel/channel-
+    account IDs needed to actually send messages via the Conversations
+    API (forward_email's real implementation needs these — sender actor
+    ID, channel ID, channel account ID — rather than guessing them, which
+    would likely just produce another opaque error like the ticket
+    pipeline issue did).
+    """
+    inboxes_resp = requests.get(f"{HUBSPOT_API_BASE}/conversations/v3/conversations/inboxes", headers=HEADERS)
+    channels_resp = requests.get(f"{HUBSPOT_API_BASE}/conversations/v3/conversations/channels", headers=HEADERS)
+    channel_accounts_resp = requests.get(
+        f"{HUBSPOT_API_BASE}/conversations/v3/conversations/channel-accounts", headers=HEADERS
+    )
+    return jsonify({
+        "inboxes": inboxes_resp.json() if inboxes_resp.ok else {"error": inboxes_resp.text},
+        "channels": channels_resp.json() if channels_resp.ok else {"error": channels_resp.text},
+        "channel_accounts": channel_accounts_resp.json() if channel_accounts_resp.ok else {"error": channel_accounts_resp.text},
+    }), 200
 
 
 @app.route("/api/webhook", methods=["POST"])
